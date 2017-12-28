@@ -13,7 +13,8 @@ class Takeoff(BaseTask):
         cube_size = 300.0  # env is cube_size x cube_size x cube_size
         self.observation_space = spaces.Box(
             np.array([- cube_size / 2, - cube_size / 2,       0.0, -1.0, -1.0, -1.0, -1.0]),
-            np.array([  cube_size / 2,   cube_size / 2, cube_size,  1.0,  1.0,  1.0,  1.0]))
+            np.array([  cube_size / 2,   cube_size / 2, cube_size,  1.0,  1.0,  1.0,  1.0])
+        )
         #print("Takeoff(): observation_space = {}".format(self.observation_space))  # [debug]
 
         # Action space: <force_x, .._y, .._z, torque_x, .._y, .._z>
@@ -21,7 +22,8 @@ class Takeoff(BaseTask):
         max_torque = 25.0
         self.action_space = spaces.Box(
             np.array([-max_force, -max_force, -max_force, -max_torque, -max_torque, -max_torque]),
-            np.array([ max_force,  max_force,  max_force,  max_torque,  max_torque,  max_torque]))
+            np.array([ max_force,  max_force,  max_force,  max_torque,  max_torque,  max_torque])
+        )
         #print("Takeoff(): action_space = {}".format(self.action_space))  # [debug]
 
         # Task-specific parameters
@@ -67,3 +69,4 @@ class Takeoff(BaseTask):
                 ), done
         else:
             return Wrench(), done
+
