@@ -1,0 +1,6 @@
+
+\.DS_Store
+
+*.pyc
+
+src/quad_controller_rl/agents/__pycache__/
