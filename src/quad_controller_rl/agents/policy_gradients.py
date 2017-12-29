@@ -17,85 +17,230 @@ class DDPG(BaseAgent):
 	def __init__(self, task):
 		# Task (environment) information
 		self.task = task
-		self.state_size = int(np.prod(self.task.observation_space.shape))
-		self.action_size = int(np.prod(self.task.action_space.shape))
-		# self.state_range = self.task.observation_space.high - self.task.observation_space.low
-		# self.action_range = self.task.action_space.high - self.task.action_space.low
+		state_dim = int(np.prod(self.task.observation_space.shape))
+		self.action_dim = int(np.prod(self.task.action_space.shape))
 
-		# Score tracker and learning parameters
-		# self.best_score = -np.inf
+		# set seeds to 0
+		np.random.seed(0)
 
-		self.noise_std = 4
-		self.noise_rate = 0.995
-
-		self.replay_memory = deque(maxlen=1000000)
 
 		# Network parameters
-		self.hidden_size = 16
-		self.learn_rate = 1e-3
+		gamma = 0.99				# reward discount factor
+		h1_actor = 8				# hidden layer 1 size for the actor
+		h2_actor = 8				# hidden layer 2 size for the actor
+		h3_actor = 8				# hidden layer 3 size for the actor
+		h1_critic = 8				# hidden layer 1 size for the critic
+		h2_critic = 8				# hidden layer 2 size for the critic
+		h3_critic = 8				# hidden layer 3 size for the critic
+		lr_actor = 1e-3				# learning rate for the actor
+		lr_critic = 1e-3			# learning rate for the critic
+		lr_decay = 1				# learning rate decay (per episode)
+		l2_reg_actor = 1e-6			# L2 regularization factor for the actor
+		l2_reg_critic = 1e-6		# L2 regularization factor for the critic
+		dropout_actor = 0			# dropout rate for actor (0 = no dropout)
+		dropout_critic = 0			# dropout rate for critic (0 = no dropout)
+		num_episodes = 15000		# number of episodes
+		max_steps_ep = 10000	# default max number of steps per episode (unless env has a lower hardcoded limit)
+		tau = 1e-2				# soft target update rate
+		self.train_every = 1			# number of steps to run the policy (and collect experience) before updating network weights
+		replay_memory_capacity = int(1e5)	# capacity of experience replay memory
+		self.minibatch_size = 1024	# size of minibatch from experience replay memory for updates
+		self.initial_noise_scale = 0.1	# scale of the exploration noise process (1.0 is the range of each action dimension)
+		self.noise_decay = 0.99		# decay rate (per episode) of the scale of the exploration noise process
+		self.exploration_mu = 0.0	# mu parameter for the exploration noise process: dXt = theta*(mu-Xt)*dt + sigma*dWt
+		self.exploration_theta = 0.15 # theta parameter for the exploration noise process: dXt = theta*(mu-Xt)*dt + sigma*dWt
+		self.exploration_sigma = 0.2	# sigma parameter for the exploration noise process: dXt = theta*(mu-Xt	)*dt + sigma*dWt
+		self.ep = 0 				# episode count
+		self.total_steps = 0		# total number of steps
 
-		self.discount_factor = 0.9
-		self.tau = 0.05
+		self.replay_memory = deque(maxlen=replay_memory_capacity)			# used for O(1) popleft() operation
 
-		self.state_input_ph = tf.placeholder(tf.float32, shape=(None, self.state_size))
-		self.action_input_ph = tf.placeholder(tf.float32, shape=(None, self.action_size))
-		self.target_q_ph = tf.placeholder(tf.float32, shape=(None, 1))
+		## Tensorflow
 
-		with tf.variable_scope("actor"):
-			self.actor_output = self.build_actor(self.state_input_ph)
+		tf.reset_default_graph()
 
-		with tf.variable_scope("critic"):
-			self.critic_output = self.build_critic(self.state_input_ph, self.action_input_ph)
+		# placeholders
+		state_ph = tf.placeholder(dtype=tf.float32, shape=[None,state_dim])
+		action_ph = tf.placeholder(dtype=tf.float32, shape=[None,self.action_dim])
+		reward_ph = tf.placeholder(dtype=tf.float32, shape=[None])
+		next_state_ph = tf.placeholder(dtype=tf.float32, shape=[None,state_dim])
+		is_not_terminal_ph = tf.placeholder(dtype=tf.float32, shape=[None]) # indicators (go into target computation)
+		is_training_ph = tf.placeholder(dtype=tf.bool, shape=()) # for dropout
 
-		with tf.variable_scope("target_actor"):
-			self.target_actor_output = self.build_actor(self.state_input_ph)
+		# episode counter
+		episodes = tf.Variable(0.0, trainable=False, name='episodes')
+		episode_inc_op = episodes.assign_add(1)
 
-		with tf.variable_scope("target_critic"):
-			self.target_critic_output = self.build_critic(self.state_input_ph, self.actor_output)
+		# will use this to initialize both the actor network its slowly-changing target network with same structure
+		def generate_actor_network(s, trainable, reuse):
+			hidden = tf.layers.dense(s, h1_actor, activation = tf.nn.relu, trainable = trainable, name = 'dense', reuse = reuse)
+			hidden_drop = tf.layers.dropout(hidden, rate = dropout_actor, training = trainable & is_training_ph)
+			hidden_2 = tf.layers.dense(hidden_drop, h2_actor, activation = tf.nn.relu, trainable = trainable, name = 'dense_1', reuse = reuse)
+			hidden_drop_2 = tf.layers.dropout(hidden_2, rate = dropout_actor, training = trainable & is_training_ph)
+			hidden_3 = tf.layers.dense(hidden_drop_2, h3_actor, activation = tf.nn.relu, trainable = trainable, name = 'dense_2', reuse = reuse)
+			hidden_drop_3 = tf.layers.dropout(hidden_3, rate = dropout_actor, training = trainable & is_training_ph)
+			actions_unscaled = tf.layers.dense(hidden_drop_3, self.action_dim, trainable = trainable, name = 'dense_3', reuse = reuse)
+			actions = self.task.action_space.low + tf.nn.sigmoid(actions_unscaled)*(self.task.action_space.high - self.task.action_space.low) # bound the actions to the valid range
+			return actions
 
+		# actor network
+		with tf.variable_scope('actor'):
+			# Policy's outputted action for each state_ph (for generating actions and training the critic)
+			self.actions = generate_actor_network(state_ph, trainable = True, reuse = False)
 
-		actor_weights = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='actor')
-		critic_weights = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='critic')
-		target_actor_weights = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_actor')
-		target_critic_weights = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='target_critic')
+		# slow target actor network
+		with tf.variable_scope('slow_target_actor', reuse=False):
+			# Slow target policy's outputted action for each next_state_ph (for training the critic)
+			# use stop_gradient to treat the output values as constant targets when doing backprop
+			slow_target_next_actions = tf.stop_gradient(generate_actor_network(next_state_ph, trainable = False, reuse = False))
 
-		self.update_target_ops = []
-		for i in range(len(actor_weights)):
-			update_target_op = target_actor_weights[i].assign(self.tau*actor_weights[i] + (1-self.tau)*target_actor_weights[i])
-			self.update_target_ops.append(update_target_op)
-		for i in range(len(critic_weights)):
-			update_target_op = target_critic_weights[i].assign(self.tau*critic_weights[i] + (1-self.tau)*target_critic_weights[i])
-			self.update_target_ops.append(update_target_op)
+		# will use this to initialize both the critic network its slowly-changing target network with same structure
+		def generate_critic_network(s, a, trainable, reuse):
+			state_action = tf.concat([s, a], axis=1)
+			hidden = tf.layers.dense(state_action, h1_critic, activation = tf.nn.relu, trainable = trainable, name = 'dense', reuse = reuse)
+			hidden_drop = tf.layers.dropout(hidden, rate = dropout_critic, training = trainable & is_training_ph)
+			hidden_2 = tf.layers.dense(hidden_drop, h2_critic, activation = tf.nn.relu, trainable = trainable, name = 'dense_1', reuse = reuse)
+			hidden_drop_2 = tf.layers.dropout(hidden_2, rate = dropout_critic, training = trainable & is_training_ph)
+			hidden_3 = tf.layers.dense(hidden_drop_2, h3_critic, activation = tf.nn.relu, trainable = trainable, name = 'dense_2', reuse = reuse)
+			hidden_drop_3 = tf.layers.dropout(hidden_3, rate = dropout_critic, training = trainable & is_training_ph)
+			q_values = tf.layers.dense(hidden_drop_3, 1, trainable = trainable, name = 'dense_3', reuse = reuse)
+			return q_values
 
-		self.critic_lose = tf.reduce_mean(tf.square(self.target_q_ph - self.critic_output))
-		self.critic_optimizer = tf.train.AdamOptimizer(self.learn_rate).minimize(self.critic_lose, var_list=critic_weights)
+		with tf.variable_scope('critic') as scope:
+			# Critic applied to state_ph and a given action (for training critic)
+			q_values_of_given_actions = generate_critic_network(state_ph, action_ph, trainable = True, reuse = False)
+			# Critic applied to state_ph and the current policy's outputted actions for state_ph (for training actor via deterministic policy gradient)
+			q_values_of_suggested_actions = generate_critic_network(state_ph, actions, trainable = True, reuse = True)
 
-		self.actor_lose = tf.reduce_mean(-self.target_critic_output)
-		self.actor_optimizer = tf.train.AdamOptimizer(self.learn_rate).minimize(self.actor_lose, var_list=actor_weights)
+		# slow target critic network
+		with tf.variable_scope('slow_target_critic', reuse=False):
+			# Slow target critic applied to slow target actor's outputted actions for next_state_ph (for training critic)
+			slow_q_values_next = tf.stop_gradient(generate_critic_network(next_state_ph, slow_target_next_actions, trainable = False, reuse = False))
 
-		self.sess = tf.Session()
+		# isolate vars for each network
+		actor_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='actor')
+		slow_target_actor_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='slow_target_actor')
+		critic_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='critic')
+		slow_target_critic_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='slow_target_critic')
+
+		# update values for slowly-changing targets towards current actor and critic
+		update_slow_target_ops = []
+		for i, slow_target_actor_var in enumerate(slow_target_actor_vars):
+			update_slow_target_actor_op = slow_target_actor_var.assign(tau*actor_vars[i]+(1-tau)*slow_target_actor_var)
+			update_slow_target_ops.append(update_slow_target_actor_op)
+
+		for i, slow_target_var in enumerate(slow_target_critic_vars):
+			update_slow_target_critic_op = slow_target_var.assign(tau*critic_vars[i]+(1-tau)*slow_target_var)
+			update_slow_target_ops.append(update_slow_target_critic_op)
+
+		update_slow_targets_op = tf.group(*update_slow_target_ops, name='update_slow_targets')
+
+		# One step TD targets y_i for (s,a) from experience replay
+		# = r_i + gamma*Q_slow(s',mu_slow(s')) if s' is not terminal
+		# = r_i if s' terminal
+		targets = tf.expand_dims(reward_ph, 1) + tf.expand_dims(is_not_terminal_ph, 1) * gamma * slow_q_values_next
+
+		# 1-step temporal difference errors
+		td_errors = targets - q_values_of_given_actions
+
+		# critic loss function (mean-square value error with regularization)
+		critic_loss = tf.reduce_mean(tf.square(td_errors))
+		for var in critic_vars:
+			if not 'bias' in var.name:
+				critic_loss += l2_reg_critic * 0.5 * tf.nn.l2_loss(var)
+
+		# critic optimizer
+		self.critic_train_op = tf.train.AdamOptimizer(lr_critic*lr_decay**episodes).minimize(critic_loss)
+
+		# actor loss function (mean Q-values under current policy with regularization)
+		actor_loss = -1*tf.reduce_mean(q_values_of_suggested_actions)
+		for var in actor_vars:
+			if not 'bias' in var.name:
+				actor_loss += l2_reg_actor * 0.5 * tf.nn.l2_loss(var)
+
+		# actor optimizer
+		# the gradient of the mean Q-values wrt actor params is the deterministic policy gradient (keeping critic params fixed)
+		self.actor_train_op = tf.train.AdamOptimizer(lr_actor*lr_decay**episodes).minimize(actor_loss, var_list=actor_vars)
+
+		# initialize session
+		self.sess = tf.Session()	
 		self.sess.run(tf.global_variables_initializer())
+
+		#####################################################################################################
+		## Training
+
+		total_steps = 0
+
 
 
 		# Episode variables
 		self.reset_episode_vars()
 
+
+	def add_to_memory(experience):
+		self.replay_memory.append(experience)
+
+	def sample_from_memory(minibatch_size):
+		return random.sample(self.replay_memory, minibatch_size)
+
+
 	def reset_episode_vars(self):
+		self.total_reward = 0
+		self.steps_in_ep = 0
+
+		# Initialize exploration noise process
+		self.noise_process = np.zeros(self.action_dim)
+		self.noise_scale = (self.initial_noise_scale * self.noise_decay**self.ep) * (self.task.action_space.high - self.task.action_space.low)
+		self.ep += 1
+
+
 		self.last_state = None
 		self.last_action = None
+		self.reward = 0.0
 		self.total_reward = 0.0
 		self.count = 0
 
-	def step(self, state, reward, done):
-		# Choose an action
-		action = self.act(state) + normal(0, self.noise_std)
+	def step(self, observation, reward, done):
+		# choose action based on deterministic policy
+		action_for_state, = self.sess.run(self.actions, feed_dict = {
+			state_ph: observation, 
+			is_training_ph: False
+		})
+
+		# add temporally-correlated exploration noise to action (using an Ornstein-Uhlenbeck process)
+		# print(action_for_state)
+		self.noise_process = self.exploration_theta*(self.exploration_mu - self.noise_process) + self.exploration_sigma*np.random.randn(self.action_dim)
+		# print(self.noise_scale*self.noise_process)
+		action_for_state += self.noise_scale*self.noise_process
+
+		self.total_reward += reward
+
 		
 		# Save experience / reward
-		if self.last_state is not None and self.last_action is not None:
-			self.total_reward += reward
-			self.count += 1
+		if self.last_observation is not None and self.last_action is not None:
+			self.add_to_memory((self.last_observation, self.last_action, reward, observation, 
+				# is next_observation a terminal state?
+				# 0.0 if done and not env.env._past_limit() else 1.0))
+				0.0 if done else 1.0))
 
-			self.replay_memory.append([self.last_state, self.last_action, reward, state])
+		# update network weights to fit a minibatch of experience
+		if self.total_steps%self.train_every == 0 and len(self.replay_memory) >= self.minibatch_size:
+
+			# grab N (s,a,r,s') tuples from replay memory
+			minibatch = self.sample_from_memory(self.minibatch_size)
+
+			# update the critic and actor params using mean-square value error and deterministic policy gradient, respectively
+			_, _ = self.sess.run([self.critic_train_op, self.actor_train_op], 
+				feed_dict = {
+					state_ph: np.asarray([elem[0] for elem in minibatch]),
+					action_ph: np.asarray([elem[1] for elem in minibatch]),
+					reward_ph: np.asarray([elem[2] for elem in minibatch]),
+					next_state_ph: np.asarray([elem[3] for elem in minibatch]),
+					is_not_terminal_ph: np.asarray([elem[4] for elem in minibatch]),
+					is_training_ph: True})
+
+			# update slow actor and critic targets towards current actor and critic
+			_ = self.sess.run(update_slow_targets_op)
 
 		# Learn, if at end of episode
 		if done:
@@ -106,72 +251,4 @@ class DDPG(BaseAgent):
 		self.last_action = action
 		return action
 
-	def act(self, state):
-		state = np.reshape(np.array(state), (-1, self.state_size))
-		action = self.sess.run(self.actor_output, {self.state_input_ph: state})
-		return action
-
-		# action = self.task.action_space.sample()
-		# return action
-
-	def learn(self):
-		self.noise_std *= self.noise_rate
-		for _ in range(min(100, len(self.replay_memory) // 256)):
-			self.batch_updade(128)
-			
-		# print("DDPG.learn(): t = {:4d}, score = {:7.3f} (best = {:7.3f}), noise_scale = {}".format(self.count, score, self.best_score, self.noise_scale))
-
-
-	def build_actor(self, state_input):
-		actor_fc_1 = slim.fully_connected(state_input, self.hidden_size, activation_fn=tf.nn.relu)
-		actor_fc_2 = slim.fully_connected(actor_fc_1, self.hidden_size, activation_fn=tf.nn.relu)
-		actor_fc_3 = slim.fully_connected(actor_fc_2, self.hidden_size, activation_fn=tf.nn.relu)
-		actor_fc_4 = slim.fully_connected(actor_fc_3, self.hidden_size, activation_fn=tf.nn.tanh)
-		actor_output = slim.fully_connected(actor_fc_4, self.action_size, activation_fn=tf.nn.tanh) * 2
-		return actor_output
-
-	def build_critic(self, state_input, action_input):
-		critic_input = slim.flatten(tf.concat([state_input, action_input], axis=1))
-		critic_fc_1 = slim.fully_connected(critic_input, self.hidden_size, activation_fn=tf.nn.relu)
-		critic_fc_2 = slim.fully_connected(critic_fc_1, self.hidden_size, activation_fn=tf.nn.relu)
-		critic_fc_3 = slim.fully_connected(critic_fc_2, self.hidden_size, activation_fn=tf.nn.tanh)
-		critic_fc_4 = slim.fully_connected(critic_fc_3, self.hidden_size, activation_fn=tf.nn.tanh)
-		critic_output = slim.fully_connected(critic_fc_4, 1, activation_fn=None)
-		return critic_output
-
-
-	def sample_from_memory(self, batch_size):
-		return random.sample(self.replay_memory, batch_size)
-
-	def batch_updade(self, batch_size):
-		batch = self.sample_from_memory(batch_size)
-		state_0 = np.reshape(np.vstack([b[0] for b in batch]), (-1, self.state_size))
-		action_0 = np.reshape(np.vstack([b[1] for b in batch]), (-1, self.action_size))
-		reward_0 = np.reshape(np.vstack([b[2] for b in batch]), (-1, 1))
-		state_1 = np.reshape(np.vstack([b[3] for b in batch]), (-1, self.state_size))
-		
-		action_1 = self.sess.run(self.actor_output, {
-				self.state_input_ph:state_1
-			}
-		)
-		q = self.sess.run(self.critic_output, {
-				self.state_input_ph: state_1, 
-				self.action_input_ph: action_1
-			}
-		)
-		target_q = reward_0 + self.discount_factor*q
-		
-		lose, _ = self.sess.run([self.critic_lose, self.critic_optimizer], { 
-				self.state_input_ph: state_0, 
-				self.action_input_ph: action_0,
-				self.target_q_ph: target_q
-			}
-		)
-
-		lose, _ = self.sess.run([self.actor_lose, self.actor_optimizer], {
-				self.state_input_ph: state_0
-			}
-		)
-		
-		self.sess.run(self.update_target_ops)
 
