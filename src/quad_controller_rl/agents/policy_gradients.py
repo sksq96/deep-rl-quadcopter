@@ -39,13 +39,10 @@ class DDPG(BaseAgent):
 		l2_reg_critic = 1e-6		# L2 regularization factor for the critic
 		dropout_actor = 0			# dropout rate for actor (0 = no dropout)
 		dropout_critic = 0			# dropout rate for critic (0 = no dropout)
-		num_episodes = 15000		# number of episodes
-		max_steps_ep = 10000	# default max number of steps per episode (unless env has a lower hardcoded limit)
 		tau = 1e-2				# soft target update rate
 		self.train_every = 1			# number of steps to run the policy (and collect experience) before updating network weights
-		replay_memory_capacity = int(1e5)	# capacity of experience replay memory
 		self.minibatch_size = 1024	# size of minibatch from experience replay memory for updates
-		self.initial_noise_scale = 0.1	# scale of the exploration noise process (1.0 is the range of each action dimension)
+		self.initial_noise_scale = 1	# scale of the exploration noise process (1.0 is the range of each action dimension)
 		self.noise_decay = 0.99		# decay rate (per episode) of the scale of the exploration noise process
 		self.exploration_mu = 0.0	# mu parameter for the exploration noise process: dXt = theta*(mu-Xt)*dt + sigma*dWt
 		self.exploration_theta = 0.15 # theta parameter for the exploration noise process: dXt = theta*(mu-Xt)*dt + sigma*dWt
@@ -53,6 +50,8 @@ class DDPG(BaseAgent):
 		self.ep = 0 				# episode count
 		self.total_steps = 0		# total number of steps
 
+		
+		replay_memory_capacity = int(1e5)	# capacity of experience replay memory
 		self.replay_memory = deque(maxlen=replay_memory_capacity)			# used for O(1) popleft() operation
 
 		## Tensorflow
@@ -110,7 +109,7 @@ class DDPG(BaseAgent):
 			# Critic applied to self.state_ph and a given action (for training critic)
 			q_values_of_given_actions = generate_critic_network(self.state_ph, self.action_ph, trainable = True, reuse = False)
 			# Critic applied to self.state_ph and the current policy's outputted actions for self.state_ph (for training actor via deterministic policy gradient)
-			q_values_of_suggested_actions = generate_critic_network(self.state_ph, actions, trainable = True, reuse = True)
+			q_values_of_suggested_actions = generate_critic_network(self.state_ph, self.actions, trainable = True, reuse = True)
 
 		# slow target critic network
 		with tf.variable_scope('slow_target_critic', reuse=False):
@@ -166,21 +165,15 @@ class DDPG(BaseAgent):
 		self.sess = tf.Session()	
 		self.sess.run(tf.global_variables_initializer())
 
-		#####################################################################################################
-		## Training
-
-		total_steps = 0
-
-
-
+		
 		# Episode variables
 		self.reset_episode_vars()
 
 
-	def add_to_memory(experience):
+	def add_to_memory(self, experience):
 		self.replay_memory.append(experience)
 
-	def sample_from_memory(minibatch_size):
+	def sample_from_memory(self, minibatch_size):
 		return random.sample(self.replay_memory, minibatch_size)
 
 
@@ -193,14 +186,10 @@ class DDPG(BaseAgent):
 		self.noise_scale = (self.initial_noise_scale * self.noise_decay**self.ep) * (self.task.action_space.high - self.task.action_space.low)
 		self.ep += 1
 
-
-		self.last_state = None
+		self.last_observation = None
 		self.last_action = None
-		self.reward = 0.0
-		self.total_reward = 0.0
-		self.count = 0
-
-	def step(self, observation, reward, done):
+		
+	def step(self, observation, reward, done, z):
 		# choose action based on deterministic policy
 		action_for_state, = self.sess.run(self.actions, feed_dict = {
 			self.state_ph: observation, 
@@ -218,7 +207,7 @@ class DDPG(BaseAgent):
 		
 		# Save experience / reward
 		if self.last_observation is not None and self.last_action is not None:
-			self.add_to_memory((self.last_observation, self.last_action, reward, observation, 
+			self.add_to_memory((self.last_observation[0], self.last_action, reward, observation[0], 
 				# is next_observation a terminal state?
 				# 0.0 if done and not env.env._past_limit() else 1.0))
 				0.0 if done else 1.0))
@@ -244,18 +233,17 @@ class DDPG(BaseAgent):
 
 
 		self.last_observation = observation
-		self.last_action = action
+		self.last_action = action_for_state
 		self.total_steps += 1
 		self.steps_in_ep += 1
 		
 
 		# Learn, if at end of episode
 		if done:
-			_ = sess.run(self.episode_inc_op)
+			_ = self.sess.run(self.episode_inc_op)
+			print('Reward: {:.3f}, Steps: {:.3f}, Final noise scale: {:.3f}, Z: {:.3f}'.format(self.total_reward, self.steps_in_ep, self.noise_scale[0], z))
 			self.reset_episode_vars()
-			print('Episode %2i, Reward: %7.3f, Steps: %i, Final noise scale: %7.3f'%(self.ep, self.total_reward, self.steps_in_ep, self.noise_scale))
 
-		return action
-
+		return action_for_state
 
 
