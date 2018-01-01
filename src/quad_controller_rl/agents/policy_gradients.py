@@ -5,11 +5,9 @@ from quad_controller_rl.agents.base_agent import BaseAgent
 
 import tensorflow as tf 
 import numpy as np 
-import tensorflow.contrib.slim as slim
 import gym
 import random
 from collections import deque
-from numpy.random import normal
 
 class DDPG(BaseAgent):
 	"""Sample agent that searches for optimal policy deterministically."""
@@ -18,37 +16,44 @@ class DDPG(BaseAgent):
 		# Task (environment) information
 		self.task = task
 		state_dim = int(np.prod(self.task.observation_space.shape))
-		self.action_dim = int(np.prod(self.task.action_space.shape))
+		# self.action_dim = int(np.prod(self.task.action_space.shape))
+		
+		# use only z-coordinate
+		self.action_dim = 1
+		self.action_space_low = self.task.action_space.low[3]
+		self.action_space_high = self.task.action_space.high[3]
 
 		# set seeds to 0
 		np.random.seed(0)
 
 
 		# Network parameters
-		gamma = 0.99				# reward discount factor
-		h1_actor = 8				# hidden layer 1 size for the actor
-		h2_actor = 8				# hidden layer 2 size for the actor
-		h3_actor = 8				# hidden layer 3 size for the actor
-		h1_critic = 8				# hidden layer 1 size for the critic
-		h2_critic = 8				# hidden layer 2 size for the critic
-		h3_critic = 8				# hidden layer 3 size for the critic
-		lr_actor = 1e-3				# learning rate for the actor
-		lr_critic = 1e-3			# learning rate for the critic
-		lr_decay = 1				# learning rate decay (per episode)
-		l2_reg_actor = 1e-6			# L2 regularization factor for the actor
-		l2_reg_critic = 1e-6		# L2 regularization factor for the critic
-		dropout_actor = 0			# dropout rate for actor (0 = no dropout)
-		dropout_critic = 0			# dropout rate for critic (0 = no dropout)
-		tau = 1e-2				# soft target update rate
-		self.train_every = 1			# number of steps to run the policy (and collect experience) before updating network weights
-		self.minibatch_size = 1024	# size of minibatch from experience replay memory for updates
-		self.initial_noise_scale = 1	# scale of the exploration noise process (1.0 is the range of each action dimension)
-		self.noise_decay = 0.99		# decay rate (per episode) of the scale of the exploration noise process
-		self.exploration_mu = 0.0	# mu parameter for the exploration noise process: dXt = theta*(mu-Xt)*dt + sigma*dWt
-		self.exploration_theta = 0.15 # theta parameter for the exploration noise process: dXt = theta*(mu-Xt)*dt + sigma*dWt
-		self.exploration_sigma = 0.2	# sigma parameter for the exploration noise process: dXt = theta*(mu-Xt	)*dt + sigma*dWt
-		self.ep = 0 				# episode count
-		self.total_steps = 0		# total number of steps
+		gamma = 0.99			
+		h1_actor = 8			
+		h2_actor = 8			
+		h3_actor = 8			
+		h1_critic = 8			
+		h2_critic = 8			
+		h3_critic = 8			
+		lr_actor = 1e-3			
+		lr_critic = 1e-3		
+		lr_decay = 1			
+		l2_reg_actor = 1e-6		
+		l2_reg_critic = 1e-6	
+		dropout_actor = 0		
+		dropout_critic = 0		
+		tau = 1e-2				
+		
+		self.train_every = 1		
+		self.minibatch_size = 1024
+		self.initial_noise_scale = 10
+		self.noise_decay = 0.99	
+		self.exploration_mu = 0.0
+		self.exploration_theta = 0.15
+		self.exploration_sigma = 0.2
+		self.ep = 0 			
+		self.total_steps = 0	
+		self.log_file = open("log_file" + str(time.time()))
 
 		
 		replay_memory_capacity = int(1e5)	# capacity of experience replay memory
@@ -79,7 +84,7 @@ class DDPG(BaseAgent):
 			hidden_3 = tf.layers.dense(hidden_drop_2, h3_actor, activation = tf.nn.relu, trainable = trainable, name = 'dense_2', reuse = reuse)
 			hidden_drop_3 = tf.layers.dropout(hidden_3, rate = dropout_actor, training = trainable & self.is_training_ph)
 			actions_unscaled = tf.layers.dense(hidden_drop_3, self.action_dim, trainable = trainable, name = 'dense_3', reuse = reuse)
-			actions = self.task.action_space.low + tf.nn.sigmoid(actions_unscaled)*(self.task.action_space.high - self.task.action_space.low) # bound the actions to the valid range
+			actions = self.action_space_low + tf.nn.sigmoid(actions_unscaled)*(self.action_space_high - self.action_space_low) # bound the actions to the valid range
 			return actions
 
 		# actor network
@@ -183,13 +188,13 @@ class DDPG(BaseAgent):
 
 		# Initialize exploration noise process
 		self.noise_process = np.zeros(self.action_dim)
-		self.noise_scale = (self.initial_noise_scale * self.noise_decay**self.ep) * (self.task.action_space.high - self.task.action_space.low)
+		self.noise_scale = (self.initial_noise_scale * self.noise_decay**self.ep) * (self.action_space_high - self.action_space_low)
 		self.ep += 1
 
 		self.last_observation = None
 		self.last_action = None
 		
-	def step(self, observation, reward, done, z):
+	def step(self, observation, reward, done):
 		# choose action based on deterministic policy
 		action_for_state, = self.sess.run(self.actions, feed_dict = {
 			self.state_ph: observation, 
@@ -238,12 +243,12 @@ class DDPG(BaseAgent):
 		self.steps_in_ep += 1
 		
 
-		# Learn, if at end of episode
 		if done:
 			_ = self.sess.run(self.episode_inc_op)
-			print('Reward: {:.3f}, Steps: {:.3f}, Final noise scale: {:.3f}, Z: {:.3f}'.format(self.total_reward, self.steps_in_ep, self.noise_scale[0], z))
+			print('Reward: {:.3f}, Steps: {:.3f}, Final noise scale: {:.3f}, Z: {:.3f}'.format(self.total_reward, self.steps_in_ep, self.noise_scale, state[0]))
+			print(self.ep, self.total_reward)
 			self.reset_episode_vars()
 
-		return action_for_state
+		return np.array([0,0] + list(action_for_state) + [0,0,0])
 
 
